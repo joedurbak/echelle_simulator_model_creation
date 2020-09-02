@@ -1,6 +1,7 @@
 # coding=utf-8
-import os.path
+import os
 import io
+import re
 import collections as co
 
 import tables
@@ -167,8 +168,20 @@ default_config_to_order_array = np.asarray(default_config_to_order_array)
 default_ccd = PyEchelle.CCD(2048, 2048, 19, 'y', name='H2RG')
 
 
+def affine_tsv_filename():
+    filenames = os.listdir(".")
+    affine_filenames = [re.findall('affine_\d+.tsv', f) for f in filenames]
+    found_ints = [re.findall('\d+', f[0]) for f in affine_filenames if f]
+    found_ints = [int(i[0]) for i in found_ints if i]
+    if found_ints:
+        found_int = max(found_ints) + 1
+    else:
+        found_int = 0
+    return "affine_{0:03d}.tsv".format(found_int)
+
+
 def do_affine_transformation_calculation(
-        ccd=default_ccd, config_to_order_array=default_config_to_order_array, band='YJ', fw=80, fh=800
+        ccd=default_ccd, config_to_order_array=default_config_to_order_array, band='YJ', sw=80, sh=800
 ):
     """
     Calculates Affine Matrices that describe spectrograph
@@ -188,18 +201,33 @@ def do_affine_transformation_calculation(
     :return:
     """
     from skimage import transform as tf
-
     ray_trace_csv = 'RIMAS_{}_affine_dependencies.csv'.format(band.upper())
     df = pd.read_csv(ray_trace_csv, encoding='utf-16')
     df['config'] = df['config'].astype(np.int)
     df['order'] = config_to_order_array[df['config']-1]
+
+    unique_orders = df['order'].unique()
+    fields = df[['fieldy', 'fieldx']]
+    unique_fields = fields.drop_duplicates()
+    unique_fields_array = unique_fields.to_numpy()
+    nfields = len((unique_fields_array.tolist()))
+
+    # norm_field = np.zeros(fields.shape)
+    # norm_field[fields > 0] = 1
+    # norm_field[fields < 0] = -1
+    norm_field = fields.loc[0:(nfields-1), :]
+    norm_field = norm_field.to_numpy()
+    norm_field = norm_field.astype(np.int)
+    norm_field_list = norm_field.tolist()
+    # nw = fields[0].max()
+    # nh = fields[1].max()
+    fw = sw
+    fh = sh
     sampling_input_x = fw
     sampling_input_y = fh
-    unique_orders = df['order'].unique()
-    norm_field = (df[['fieldy', 'fieldx']].drop_duplicates()).to_numpy()
     res = {
         'MatricesPerOrder': np.int(unique_orders.shape[0]),
-        'norm_field': norm_field.tolist(),
+        'norm_field': norm_field_list,
         'sampling_input_x': np.int(sampling_input_x)
     }
 
@@ -208,8 +236,8 @@ def do_affine_transformation_calculation(
 
     res['field_width'] = np.double(fw)
     res['field_height'] = np.double(fh)
-    sampling_x = sampling_input_x
-    sampling_y = sampling_input_x * fh / fw
+    # sampling_x = sampling_input_x
+    # sampling_y = sampling_input_x * fh / fw
 
     src = np.array(norm_field, dtype=float)
     src[:, 0] -= np.min(src[:, 0])
@@ -234,26 +262,37 @@ def do_affine_transformation_calculation(
     dst = np.vstack((dst_x, dst_y))
     dst /= (ccd.pixelSize / 1000.)
     dst += ccd.Nx / 2
-    norm_field_len = len(norm_field)
-    dst = dst.reshape(2, len(dst[0]) / norm_field_len, norm_field_len).transpose((1, 2, 0))
+    dst = dst.reshape(2, len(dst[0]) / nfields, nfields).transpose((1, 2, 0))
 
-    orders = orders.reshape((len(orders) / len(norm_field), len(norm_field)))
-    wavelength = wavelength.reshape((len(wavelength) / len(norm_field), len(norm_field)))
+    orders = orders.reshape((len(orders) / nfields, nfields))
+    wavelength = wavelength.reshape((len(wavelength) / nfields, nfields))
 
     affine_matrices = {}
     transformations = {}
-
+    p_headers = ["p{:d}".format(i) for i in range(nfields)]
+    src_headers = ["src{:d}".format(i) for i in range(nfields)]
+    affine_tsv_headers = ["order", "wavelength"] + p_headers + src_headers + [
+        "rotation", "scale0", "scale1", "shear", "translation0", "translation1"
+    ]
+    affine_save_lines = ["\t".join(affine_tsv_headers)]
     for order, wavel, p in zip(orders, wavelength, dst):
+        print("affine transformation inputs {} {}".format(src,p))
+        p_list = [i for i in p]
+        src_list = [i for i in src]
+        inputs_list = [order[0], wavel[0]] + p_list + src_list
         params = tf.estimate_transform('affine', src, p)
+        params_list = [
+            params.rotation, params.scale[0], params.scale[1],
+            params.shear, params.translation[0], params.translation[1]
+        ]
+        affine_save_line = inputs_list + params_list
+        affine_save_lines.append("\t".join([str(i) for i in affine_save_line]))
         if affine_matrices.has_key(order[0]):
-            affine_matrices[order[0]].update({wavel[0]: np.array(
-                [params.rotation, params.scale[0], params.scale[1], params.shear, params.translation[0],
-                 params.translation[1]])})
+            affine_matrices[order[0]].update({wavel[0]: np.array(params_list)})
         else:
-            affine_matrices[order[0]] = {wavel[0]: np.array(
-                [params.rotation, params.scale[0], params.scale[1], params.shear, params.translation[0],
-                 params.translation[1]])}
-
+            affine_matrices[order[0]] = {wavel[0]: np.array(params_list)}
+    with open(affine_tsv_filename(), 'w') as f:
+        f.write("\n".join(affine_save_lines))
     res['matrices'] = affine_matrices
     return res
 
@@ -317,8 +356,12 @@ if __name__ == '__main__':
     att = do_affine_transformation_calculation(spectrograph.CCD, config_array, 'YJ')
     psfs = get_psfs(config_array, 8, 'YJ')
 
-    directory = r''
-    filename = os.path.join(directory, 'RIMAS_YJ.hdf')
+    directory = r'..\..\Documents\echelle\spectrographs'
+    files = os.listdir(directory)
+    iterations = [re.findall('\d+', f) for f in files]
+    iterations = [int(i[0]) for i in iterations if i != []]
+    iteration = max(iterations) + 1
+    filename = os.path.join(directory, 'RIMAS_YJ_v{:d}.hdf'.format(iteration))
     PyEchelle.save_spectrograph_info_to_hdf(filename, spectrograph)
     PyEchelle.save_CCD_info_to_hdf(filename, spectrograph.CCD)
     PyEchelle.save_transformation_to_hdf(filename, att, 1)
